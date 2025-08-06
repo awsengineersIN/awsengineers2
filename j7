@@ -1,0 +1,59 @@
+stage('Display Lambda Logs') {
+    steps {
+        script {
+            echo "📜 Lambda Execution Logs:"
+            echo "=" * 80
+            
+            try {
+                // Get function name from ARN
+                def functionName = env.LAMBDA_ARN.split(':')[6]
+                def logGroupName = "/aws/lambda/${functionName}"
+                
+                // Get latest log stream - use single quotes to avoid variable interpolation
+                def logStreamCmd = '''
+                    aws logs describe-log-streams \
+                        --log-group-name ''' + logGroupName + ''' \
+                        --order-by LastEventTime \
+                        --descending \
+                        --max-items 1 \
+                        --query 'logStreams[0].logStreamName' \
+                        --output text
+                '''
+                
+                def latestStream = sh(script: logStreamCmd, returnStdout: true).trim()
+                
+                if (latestStream && latestStream != 'None') {
+                    echo "📋 Latest Log Stream: ${latestStream}"
+                    
+                    // Calculate start time (10 minutes ago in milliseconds)
+                    def startTime = System.currentTimeMillis() - (10 * 60 * 1000)
+                    
+                    // Get log events - use single quotes and escape properly
+                    def logEventsCmd = '''
+                        aws logs get-log-events \
+                            --log-group-name ''' + logGroupName + ''' \
+                            --log-stream-name "''' + latestStream + '''" \
+                            --start-time ''' + startTime + ''' \
+                            --query 'events[*].message' \
+                            --output text
+                    '''
+                    
+                    def logs = sh(script: logEventsCmd, returnStdout: true).trim()
+                    
+                    if (logs && logs != '' && logs != 'None') {
+                        echo logs
+                    } else {
+                        echo "No recent logs found in the last 10 minutes"
+                    }
+                } else {
+                    echo "No log streams found"
+                }
+                
+            } catch (Exception e) {
+                echo "Could not retrieve logs: ${e.message}"
+            }
+            
+            echo "=" * 80
+        }
+    }
+}
