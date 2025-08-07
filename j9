@@ -1,0 +1,12 @@
+def rawStreams = sh(script: logStreamCmd, returnStdout: true).trim()
+// Split by newline and remove empty/None lines
+def streamNames = rawStreams.split('\n').findAll { it && it != 'None' && !it.trim().isEmpty() }
+def latestStream = streamNames ? streamNames[0].trim() : ''
+
+if (latestStream) {
+    echo "📋 Latest Log Stream: ${latestStream}"
+    // Proceed to use latestStream for log fetching
+    // ...
+} else {
+    echo "No valid log streams found"
+}
