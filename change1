@@ -1,0 +1,589 @@
+# Updated Lambda Function - Multiple Account Support, Region Parameter, and EC2 Volumes
+
+## 1. Updated Lambda Function (lambda_function.py)
+
+```python
+# lambda_function.py - Enhanced AWS Inventory Lambda with Multiple Accounts and Region Support
+
+import os
+import csv
+import json
+import importlib
+import tempfile
+import zipfile
+import logging
+import re
+from pathlib import Path
+from datetime import datetime
+
+from util import assume, account_id_from_name, ou_id_from_name, accounts_in_ou
+
+# Setup logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.handlers:
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Environment variables
+SENDER = os.getenv("SENDER", None)
+MEMBER_ROLE = os.getenv("MEMBER_READ_ROLE", "ResourceReadRole")
+FALLBACK_REGIONS = os.getenv("FALLBACK_REGIONS", "us-east-1,us-west-2").split(",")
+
+# Import your custom send_email function
+from your_utils import send_email  # Replace with your actual import
+
+# Resource mapping - Added EC2Volumes
+RES_MAP = {
+    "EC2": "ec2", 
+    "EC2Volumes": "ec2_volumes",  # NEW
+    "S3": "s3", 
+    "Lambda": "lambda_", 
+    "RDS": "rds",
+    "DynamoDB": "dynamodb", 
+    "Glue": "glue", 
+    "Eventbridge": "eventbridge",
+    "StepFunctions": "stepfunctions", 
+    "SecurityHub": "securityhub", 
+    "Config": "config"
+}
+
+def validate_email(email):
+    """Basic email validation"""
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def get_enabled_regions_for_account(session, account_id):
+    """
+    Dynamically discover enabled regions for an account
+    Uses EC2 describe_regions() which only returns enabled regions
+    """
+    try:
+        # Create EC2 client from us-east-1 (always enabled by default)
+        ec2_client = session.client('ec2', region_name='us-east-1')
+        
+        # Get only enabled regions for this account
+        response = ec2_client.describe_regions()
+        enabled_regions = [region['RegionName'] for region in response['Regions']]
+        
+        # Filter out regions that might be enabling/disabling
+        stable_regions = []
+        for region in enabled_regions:
+            try:
+                # Quick test to ensure region is actually accessible
+                regional_ec2 = session.client('ec2', region_name=region)
+                regional_ec2.describe_vpcs(MaxResults=1)
+                stable_regions.append(region)
+            except Exception as e:
+                logger.warning(f"Region {region} not fully accessible for account {account_id}: {str(e)[:100]}")
+                continue
+        
+        if stable_regions:
+            logger.info(f"Account {account_id} has {len(stable_regions)} enabled regions: {stable_regions}")
+            return stable_regions
+        else:
+            logger.warning(f"No stable regions found for account {account_id}, using fallback")
+            return FALLBACK_REGIONS
+        
+    except Exception as e:
+        logger.warning(f"Failed to discover regions for account {account_id}: {e}")
+        logger.info(f"Using fallback regions for account {account_id}: {FALLBACK_REGIONS}")
+        return FALLBACK_REGIONS
+
+def write_csv(rows, headers, path):
+    """Write CSV file with proper error handling"""
+    try:
+        with open(path, "w", newline="", encoding='utf-8') as fh:
+            writer = csv.writer(fh)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        logger.info(f"CSV written successfully: {path} ({len(rows)} rows)")
+    except Exception as e:
+        logger.error(f"Failed to write CSV {path}: {e}")
+        raise
+
+def create_zip_archive(file_paths, zip_path):
+    """Create ZIP archive from list of file paths"""
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+            for file_path in file_paths:
+                if os.path.exists(file_path):
+                    zipf.write(file_path, Path(file_path).name)
+        logger.info(f"ZIP archive created: {zip_path}")
+        return os.path.getsize(zip_path)
+    except Exception as e:
+        logger.error(f"Failed to create ZIP archive: {e}")
+        raise
+
+def build_email_body(scope, target, resources, regions_requested, accounts_processed, files_created, zip_size_bytes, recipients_count, account_region_summary):
+    """Build detailed email body with inventory context and region information"""
+    
+    # Format file size for readability
+    if zip_size_bytes < 1024:
+        size_str = f"{zip_size_bytes} bytes"
+    elif zip_size_bytes < 1024 * 1024:
+        size_str = f"{zip_size_bytes / 1024:.1f} KB"
+    else:
+        size_str = f"{zip_size_bytes / (1024 * 1024):.1f} MB"
+    
+    # Build the email body
+    body = f"""AWS Resource Inventory Report
+=======================================
+
+This inventory report has been sent to {recipients_count} recipient(s).
+
+Inventory Request Details:
+--------------------------
+• Scope: {scope}
+• Target: {target}
+• Resources Requested: {', '.join(resources)}
+• Regions Requested: {', '.join(regions_requested)}
+• Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+Summary:
+--------
+• Accounts Processed: {accounts_processed}
+• CSV Files Generated: {files_created}
+• ZIP Archive Size: {size_str}
+
+Regions Used per Account:
+------------------------
+{account_region_summary}
+
+Content:
+--------
+The attached ZIP file contains CSV exports for the following AWS resources:
+"""
+    
+    for resource in resources:
+        body += f"  • {resource}\n"
+    
+    body += f"""
+Each CSV file is named in the format: <AccountID>_<ResourceType>.csv
+
+Columns vary by resource type but typically include:
+- Resource identifiers (ID/Name/ARN)
+- Resource status and configuration
+- Creation/modification dates
+- Regional information
+
+Note: 
+- For regional resources, only the requested regions are scanned
+- S3 buckets are collected globally from us-east-1 regardless of region selection
+- Regions are filtered to only include those enabled in each account
+
+For questions or support, please contact the AWS Infrastructure team.
+
+---
+This inventory was automatically generated by the AWS Resource Inventory System.
+"""
+    
+    return body
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler with region parameter support and multiple account handling
+    
+    Expected event format:
+    {
+        "scope": "Account" | "OU",
+        "target": "AccountName" or "OUName", 
+        "resources": ["EC2", "EC2Volumes", "S3", "Lambda", ...],
+        "regions": ["us-east-1", "us-west-2", "eu-west-1"],
+        "email": "user@company.com" or ["user1@company.com", "user2@company.com"]
+    }
+    """
+    logger.info(f"Lambda invoked with event: {json.dumps(event)}")
+    
+    # Input validation
+    required_fields = ['scope', 'target', 'resources', 'email']
+    for field in required_fields:
+        if field not in event or not event[field]:
+            error_msg = f"Missing or empty required field: {field}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+    
+    scope = event["scope"]
+    target = event["target"]
+    resources = event["resources"]
+    email_input = event["email"]
+    regions_requested = event.get("regions", ["us-east-1", "us-west-2"])  # Default regions
+    
+    if not SENDER:
+        error_msg = "Missing SENDER environment variable"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    # Parse multiple emails - handle both string and list formats
+    if isinstance(email_input, str):
+        recipients = [email.strip() for email in email_input.split(',') if email.strip()]
+    elif isinstance(email_input, list):
+        recipients = [email.strip() for email in email_input if email.strip()]
+    else:
+        raise ValueError("Email parameter must be a string or list")
+    
+    if not recipients:
+        raise ValueError("No valid email addresses provided")
+    
+    # Validate all email addresses
+    invalid_emails = [email for email in recipients if not validate_email(email)]
+    if invalid_emails:
+        raise ValueError(f"Invalid email addresses: {', '.join(invalid_emails)}")
+    
+    # Validate regions format
+    if not isinstance(regions_requested, list):
+        raise ValueError("Regions must be provided as a list")
+    
+    logger.info(f"Processing inventory for {len(recipients)} recipients: {recipients}")
+    logger.info(f"Processing inventory: scope={scope}, target={target}, resources={resources}, regions={regions_requested}")
+    
+    csv_files = []
+    tmpdir = Path(tempfile.gettempdir())
+    account_region_map = {}  # Track regions used per account
+    
+    try:
+        # Resolve accounts based on scope
+        if scope == "Account":
+            accounts = [account_id_from_name(target)]
+        elif scope == "OU":
+            ou_id = ou_id_from_name(target)
+            accounts = list(accounts_in_ou(ou_id))  # Convert tuple to list for better handling
+        else:
+            raise ValueError(f"Invalid scope: {scope}")
+        
+        logger.info(f"Resolved {len(accounts)} accounts: {accounts}")
+        
+        # Process each account
+        for acct in accounts:
+            role_arn = f"arn:aws:iam::{acct}:role/{MEMBER_ROLE}"
+            logger.info(f"Processing account: {acct}")
+            
+            try:
+                session = assume(role_arn, "inventory-run")
+                logger.info(f"Successfully assumed role for account: {acct}")
+                
+                # Determine regions to use for this account
+                if regions_requested:
+                    # Use user-specified regions, but validate they're enabled
+                    try:
+                        enabled_regions = get_enabled_regions_for_account(session, acct)
+                        # Filter requested regions to only those enabled in this account
+                        account_regions = [r for r in regions_requested if r in enabled_regions]
+                        if not account_regions:
+                            logger.warning(f"None of the requested regions {regions_requested} are enabled in account {acct}")
+                            account_regions = enabled_regions[:2]  # Use first 2 enabled regions as fallback
+                    except Exception as e:
+                        logger.error(f"Failed to validate regions for account {acct}: {e}")
+                        account_regions = regions_requested  # Use requested regions anyway
+                else:
+                    # Fall back to dynamic discovery if no regions specified
+                    account_regions = get_enabled_regions_for_account(session, acct)
+                
+                account_region_map[acct] = account_regions
+                logger.info(f"Will scan account {acct} in regions: {account_regions}")
+                
+            except Exception as e:
+                logger.error(f"Failed to assume role for account {acct}: {e}")
+                continue
+            
+            # Process each resource type
+            for res in resources:
+                mod_name = RES_MAP.get(res)
+                if not mod_name:
+                    logger.warning(f"Unknown resource type: {res}")
+                    continue
+                
+                try:
+                    mod = importlib.import_module(f"resource_fetchers.{mod_name}")
+                    logger.info(f"Loaded module for resource: {res}")
+                except ImportError as e:
+                    logger.error(f"Failed to import module for {res}: {e}")
+                    continue
+                
+                try:
+                    rows = []
+                    # Use account-specific regions (except S3 which is global)
+                    regions_to_scan = ["us-east-1"] if res == "S3" else account_regions
+                    
+                    for region in regions_to_scan:
+                        try:
+                            region_rows = mod.collect(session, acct, region)
+                            rows.extend(region_rows)
+                            logger.info(f"Collected {len(region_rows)} rows for {res} in {region} (account {acct})")
+                        except Exception as e:
+                            logger.error(f"Failed to collect {res} from {region} in account {acct}: {str(e)[:200]}")
+                            continue
+                    
+                    if not rows:
+                        logger.info(f"No data found for {res} in account {acct}")
+                        continue
+                    
+                    # Write CSV
+                    csv_name = f"{acct}_{res}.csv"
+                    csv_path = tmpdir / csv_name
+                    write_csv(rows, mod.HEADERS, csv_path)
+                    csv_files.append(str(csv_path))
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting {res} for account {acct}: {e}")
+                    continue
+        
+        # Build account-region summary for email
+        account_region_summary = "\n".join([
+            f"• {acct}: {', '.join(regions)}"
+            for acct, regions in account_region_map.items()
+        ])
+        
+        if not csv_files:
+            logger.info("No data collected - sending notification email")
+            
+            # Build no-data email body with context
+            no_data_body = f"""AWS Resource Inventory Report - No Data Found
+=====================================================
+
+This notification has been sent to {len(recipients)} recipient(s).
+
+Inventory Request Details:
+--------------------------
+• Scope: {scope}
+• Target: {target}
+• Resources Requested: {', '.join(resources)}
+• Regions Requested: {', '.join(regions_requested)}
+• Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+Regions Attempted per Account:
+-----------------------------
+{account_region_summary}
+
+Result:
+-------
+No resources were found matching your criteria.
+
+This could be due to:
+- No resources of the requested types exist in the target {scope.lower()}
+- Access permissions preventing resource discovery
+- All resources in the specified regions being filtered out
+
+Please verify:
+1. The target {scope.lower()} name is correct
+2. The cross-account IAM role has appropriate read permissions
+3. Resources exist in the specified regions for each account
+
+For assistance, please contact the AWS Infrastructure team.
+"""
+            
+            try:
+                result = send_email(
+                    sender_addr=SENDER,
+                    receiver_addr=recipients,
+                    email_subject=f"AWS Inventory - No Data Found ({scope}: {target})",
+                    email_body=no_data_body,
+                    email_attachment=None
+                )
+                logger.info(f"No-data notification result: {result}")
+                return {"message": "No data found - notification sent", "recipients": recipients}
+            except Exception as e:
+                logger.error(f"Failed to send no-data notification: {e}")
+                raise
+        
+        # Create ZIP archive
+        timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        zip_filename = f"aws-inventory-{timestamp}.zip"
+        zip_path = tmpdir / zip_filename
+        
+        zip_size = create_zip_archive(csv_files, zip_path)
+        logger.info(f"Created ZIP archive with {len(csv_files)} files, size: {zip_size} bytes")
+        
+        # Build detailed email body with context and region information
+        email_body = build_email_body(
+            scope=scope,
+            target=target, 
+            resources=resources,
+            regions_requested=regions_requested,
+            accounts_processed=len(accounts),
+            files_created=len(csv_files),
+            zip_size_bytes=zip_size,
+            recipients_count=len(recipients),
+            account_region_summary=account_region_summary
+        )
+        
+        # Build subject with context
+        subject = f"AWS Resource Inventory - {scope}: {target} ({len(csv_files)} files)"
+        
+        try:
+            result = send_email(
+                sender_addr=SENDER,
+                receiver_addr=recipients,
+                email_subject=subject,
+                email_body=email_body,
+                email_attachment=str(zip_path)
+            )
+            logger.info(f"Email send result: {result}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+            raise
+        
+        return {
+            "message": f"Successfully sent AWS inventory with {len(csv_files)} files to {len(recipients)} recipients",
+            "recipients": recipients,
+            "accounts_processed": len(accounts),
+            "files_created": len(csv_files),
+            "zip_size_bytes": zip_size,
+            "scope": scope,
+            "target": target,  
+            "resources": resources,
+            "regions_requested": regions_requested,
+            "account_regions": account_region_map
+        }
+    
+    except Exception as e:
+        logger.error(f"Lambda execution failed: {str(e)}")
+        raise
+    
+    finally:
+        # Cleanup temporary files
+        try:
+            for file_path in csv_files:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            if 'zip_path' in locals() and os.path.exists(zip_path):
+                os.remove(zip_path)
+            logger.info("Temporary files cleaned up")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temporary files: {e}")
+```
+
+## 2. New EC2 Volumes Resource Fetcher (resource_fetchers/ec2_volumes.py)
+
+```python
+import boto3
+from botocore.exceptions import ClientError
+
+HEADERS = ["VolumeId", "VolumeType", "Size", "State", "CreateTime", "AttachedTo", "Device", "AvailabilityZone", "Encrypted", "Iops", "Region", "Arn"]
+
+def collect(session, account_id, region):
+    """Collect EBS volume information"""
+    rows = []
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        paginator = ec2.get_paginator("describe_volumes")
+        
+        for page in paginator.paginate():
+            for volume in page.get("Volumes", []):
+                # Get attachment information
+                attached_to = ""
+                device = ""
+                if volume.get("Attachments"):
+                    attachment = volume["Attachments"][0]  # Get first attachment
+                    attached_to = attachment.get("InstanceId", "")
+                    device = attachment.get("Device", "")
+                
+                # Build ARN
+                arn = f"arn:aws:ec2:{region}:{account_id}:volume/{volume['VolumeId']}"
+                
+                rows.append([
+                    volume["VolumeId"],
+                    volume.get("VolumeType", ""),
+                    volume.get("Size", 0),
+                    volume["State"],
+                    volume["CreateTime"].strftime("%Y-%m-%d %H:%M:%S"),
+                    attached_to,
+                    device,
+                    volume.get("AvailabilityZone", ""),
+                    volume.get("Encrypted", False),
+                    volume.get("Iops", 0),
+                    region,
+                    arn
+                ])
+                    
+    except ClientError as e:
+        if e.response['Error']['Code'] not in ['UnauthorizedOperation', 'AccessDenied']:
+            raise
+    except Exception as e:
+        raise Exception(f"EC2 Volumes collection error in {region}: {str(e)}")
+    
+    return rows
+```
+
+## 3. Updated Jenkins Parameters
+
+### REGIONS Parameter (New)
+```groovy
+extendedChoice(
+    name: 'REGIONS',
+    type: 'PT_CHECKBOX',
+    multiSelectDelimiter: ',',
+    value: 'us-east-1,us-west-2,eu-west-1,eu-central-1,ap-southeast-1,ap-northeast-1',
+    visibleItemCount: 6,
+    description: 'Select AWS regions to scan (multiple selection allowed)'
+)
+```
+
+### Updated RESOURCES Parameter
+```groovy
+extendedChoice(
+    name: 'RESOURCES',
+    type: 'PT_CHECKBOX',
+    multiSelectDelimiter: ',',
+    value: 'EC2,EC2Volumes,S3,Lambda,RDS,DynamoDB,Glue,Eventbridge,StepFunctions,SecurityHub,Config',
+    visibleItemCount: 11,
+    description: 'Select AWS services to include in the inventory report'
+)
+```
+
+## 4. Updated Jenkins Pipeline
+
+Add this stage to prepare the payload with regions:
+
+```groovy
+stage('Prepare Lambda Payload') {
+    steps {
+        script {
+            echo "📦 Preparing Lambda function payload..."
+            
+            // Parse resources and regions
+            def resourceList = params.RESOURCES.tokenize(',').collect { it.trim() }
+            def regionList = params.REGIONS.tokenize(',').collect { it.trim() }
+            
+            // Build Lambda payload
+            def payload = [
+                scope: params.SCOPE,
+                target: params.TARGET,
+                resources: resourceList,
+                regions: regionList,  // NEW: Include regions
+                email: params.EMAIL
+            ]
+            
+            // Add fallback regions if provided
+            if (params.FALLBACK_REGIONS && params.FALLBACK_REGIONS.trim() != '') {
+                payload.fallback_regions = params.FALLBACK_REGIONS.split(',').collect { it.trim() }
+            }
+            
+            env.LAMBDA_PAYLOAD = groovy.json.JsonOutput.toJson(payload)
+            
+            echo "✅ Lambda payload prepared:"
+            echo "   Scope: ${payload.scope}"
+            echo "   Target: ${payload.target}"
+            echo "   Resources: ${payload.resources.join(', ')}"
+            echo "   Regions: ${payload.regions.join(', ')}"  // NEW
+            echo "   Email: ${payload.email}"
+        }
+    }
+}
+```
+
+## Summary of Changes
+
+1. ✅ **Multiple Account Support**: Lambda now properly handles multiple accounts from OU resolution
+2. ✅ **Region Parameter**: Added `regions` parameter to event payload and Lambda processing
+3. ✅ **Multiple Region Selection**: Users can select multiple regions via Jenkins checkboxes
+4. ✅ **EC2 Volumes Resource**: Added new resource fetcher for EBS volumes
+5. ✅ **Enhanced Email Body**: Shows requested vs used regions per account
+6. ✅ **Region Filtering**: Only scans regions that are actually enabled in each account
+
+The Lambda will now scan multiple accounts across your selected regions and include EC2 volumes in the inventory!
