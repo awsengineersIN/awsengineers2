@@ -1,0 +1,620 @@
+import boto3
+import json
+import os
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Any
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+class PatchComplianceReporter:
+    def __init__(self):
+        # Initialize AWS clients
+        self.organizations_client = boto3.client('organizations')
+        self.sts_client = boto3.client('sts')
+        
+        # Configuration
+        self.regions = ['us-east-1', 'us-west-2']
+        self.cross_account_role_name = os.environ.get('CROSS_ACCOUNT_ROLE_NAME', 'PatchComplianceRole')
+        self.sender_email = os.environ.get('SENDER_EMAIL')
+        self.recipient_emails = os.environ.get('RECIPIENT_EMAILS', '').split(',')
+        
+    def lambda_handler(self, event, context):
+        """Main Lambda handler function"""
+        try:
+            logger.info("Starting patch compliance report generation")
+            
+            # Get all organization accounts
+            accounts = self.get_organization_accounts()
+            logger.info(f"Found {len(accounts)} accounts in organization")
+            
+            # Collect compliance data from all accounts and regions
+            compliance_data = self.collect_compliance_data(accounts)
+            
+            # Generate and send email report
+            self.generate_and_send_report(compliance_data)
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Patch compliance report generated successfully')
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in lambda_handler: {str(e)}")
+            raise
+    
+    def get_organization_accounts(self) -> List[Dict]:
+        """Get all accounts in the AWS Organization"""
+        accounts = []
+        paginator = self.organizations_client.get_paginator('list_accounts')
+        
+        for page in paginator.paginate():
+            for account in page['Accounts']:
+                if account['Status'] == 'ACTIVE':
+                    accounts.append({
+                        'Id': account['Id'],
+                        'Name': account['Name'],
+                        'Email': account['Email']
+                    })
+        
+        return accounts
+    
+    def assume_cross_account_role(self, account_id: str, region: str) -> boto3.Session:
+        """Assume role in target account"""
+        role_arn = f"arn:aws:iam::{account_id}:role/{self.cross_account_role_name}"
+        
+        try:
+            response = self.sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=f"PatchCompliance-{account_id}-{region}"
+            )
+            
+            credentials = response['Credentials']
+            
+            session = boto3.Session(
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken'],
+                region_name=region
+            )
+            
+            return session
+            
+        except Exception as e:
+            logger.error(f"Failed to assume role in account {account_id}: {str(e)}")
+            return None
+    
+    def get_instance_management_summary_from_explorer(self, session: boto3.Session) -> Dict:
+        """Get EC2 instance management summary using GetOpsSummary API (same as Explorer dashboard uses)"""
+        try:
+            ssm_client = session.client('ssm')
+            
+            # Use GetOpsSummary API with correct lowercase 'count' aggregator type
+            response = ssm_client.get_ops_summary(
+                Aggregators=[
+                    {
+                        'AggregatorType': 'count',
+                        'TypeName': 'AWS:EC2InstanceInformation',
+                        'AttributeName': 'PingStatus'
+                    }
+                ],
+                ResultAttributes=[
+                    {
+                        'TypeName': 'AWS:EC2InstanceInformation'
+                    }
+                ]
+            )
+            
+            managed_count = 0  # Online instances
+            
+            # Parse the response to extract managed instances (Online status)
+            for entity in response.get('Entities', []):
+                data = entity.get('Data', {})
+                ec2_info_data = data.get('AWS:EC2InstanceInformation', {})
+                content = ec2_info_data.get('Content', [])
+                
+                for item in content:
+                    ping_status = item.get('PingStatus', '')
+                    count = int(item.get('Count', 0))
+                    
+                    if ping_status == 'Online':
+                        managed_count += count
+            
+            # Get total EC2 instances from EC2 API
+            total_ec2_instances = self.get_total_ec2_instances_from_ec2_api(session)
+            not_managed_count = max(0, total_ec2_instances - managed_count)
+            
+            return {
+                'total_ec2_instances': total_ec2_instances,
+                'managed_instances': managed_count,
+                'not_managed_instances': not_managed_count,
+                'managed_percentage': round((managed_count / max(1, total_ec2_instances)) * 100, 1) if total_ec2_instances > 0 else 0.0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting instance management summary from Explorer API: {str(e)}")
+            # Fallback to traditional method if GetOpsSummary fails
+            return self.get_instance_management_summary_fallback(session)
+    
+    def get_total_ec2_instances_from_ec2_api(self, session: boto3.Session) -> int:
+        """Get total EC2 instances from EC2 API"""
+        try:
+            ec2_client = session.client('ec2')
+            paginator = ec2_client.get_paginator('describe_instances')
+            
+            instance_count = 0
+            for page in paginator.paginate(
+                Filters=[
+                    {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
+                ]
+            ):
+                for reservation in page['Reservations']:
+                    instance_count += len(reservation['Instances'])
+            
+            return instance_count
+            
+        except Exception as e:
+            logger.error(f"Error getting total EC2 instances: {str(e)}")
+            return 0
+    
+    def get_instance_management_summary_fallback(self, session: boto3.Session) -> Dict:
+        """Fallback method using traditional APIs if GetOpsSummary fails"""
+        try:
+            # Get all EC2 instances
+            total_ec2_instances = self.get_total_ec2_instances_from_ec2_api(session)
+            
+            # Get SSM managed instances
+            ssm_client = session.client('ssm')
+            managed_count = 0
+            
+            try:
+                paginator = ssm_client.get_paginator('describe_instance_information')
+                for page in paginator.paginate():
+                    for instance in page['InstanceInformationList']:
+                        if instance.get('PingStatus') == 'Online':
+                            managed_count += 1
+            except Exception as ssm_error:
+                logger.warning(f"Error getting SSM instances: {str(ssm_error)}")
+            
+            not_managed_count = max(0, total_ec2_instances - managed_count)
+            
+            return {
+                'total_ec2_instances': total_ec2_instances,
+                'managed_instances': managed_count,
+                'not_managed_instances': not_managed_count,
+                'managed_percentage': round((managed_count / max(1, total_ec2_instances)) * 100, 1) if total_ec2_instances > 0 else 0.0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in fallback instance management summary: {str(e)}")
+            return {
+                'total_ec2_instances': 0,
+                'managed_instances': 0,
+                'not_managed_instances': 0,
+                'managed_percentage': 0.0
+            }
+    
+    def get_patch_compliance_summary_corrected(self, session: boto3.Session, managed_instances: int) -> Dict:
+        """Get patch compliance summary with corrected totals to match managed instances"""
+        try:
+            ssm_client = session.client('ssm')
+            
+            # Use ListComplianceSummaries API
+            response = ssm_client.list_compliance_summaries(
+                Filters=[
+                    {
+                        'Key': 'ComplianceType',
+                        'Values': ['Patch'],
+                        'Type': 'EQUAL'
+                    }
+                ]
+            )
+            
+            compliant_instances = 0
+            non_compliant_instances = 0
+            
+            # Parse compliance summary items
+            for item in response.get('ComplianceSummaryItems', []):
+                if item.get('ComplianceType') == 'Patch':
+                    # Get compliant summary
+                    compliant_summary = item.get('CompliantSummary', {})
+                    compliant_instances = compliant_summary.get('CompliantCount', 0)
+                    
+                    # Get non-compliant summary  
+                    non_compliant_summary = item.get('NonCompliantSummary', {})
+                    non_compliant_instances = non_compliant_summary.get('NonCompliantCount', 0)
+            
+            # Calculate unreported instances (instances without compliance data)
+            reported_instances = compliant_instances + non_compliant_instances
+            unreported_instances = max(0, managed_instances - reported_instances)
+            
+            # If we have unreported instances, add them to compliant for display purposes
+            # (This matches what AWS console typically shows)
+            if unreported_instances > 0:
+                logger.info(f"Found {unreported_instances} managed instances without compliance data")
+                # Option 1: Add to compliant (optimistic view)
+                # compliant_instances += unreported_instances
+                
+                # Option 2: Add to non-compliant (conservative view) 
+                # non_compliant_instances += unreported_instances
+                
+                # Option 3: Show as separate category (most accurate)
+                pass
+            
+            return {
+                'compliant_instances': compliant_instances,
+                'non_compliant_instances': non_compliant_instances,
+                'unreported_instances': unreported_instances
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting patch compliance summary: {str(e)}")
+            return {
+                'compliant_instances': 0,
+                'non_compliant_instances': 0,
+                'unreported_instances': managed_instances
+            }
+    
+    def collect_compliance_data(self, accounts: List[Dict]) -> Dict:
+        """Collect patch compliance data using the exact same APIs as AWS console dashboards"""
+        all_data = {
+            'accounts': {},
+            'generation_time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+            # Organization-level summaries (matching AWS console exactly)
+            'organization_summary': {
+                'total_ec2_instances': 0,
+                'managed_instances': 0,
+                'not_managed_instances': 0,
+                'managed_percentage': 0.0,
+                'compliant_instances': 0,
+                'non_compliant_instances': 0,
+                'unreported_instances': 0
+            }
+        }
+        
+        for account in accounts:
+            account_id = account['Id']
+            account_name = account['Name']
+            
+            logger.info(f"Processing account: {account_name} ({account_id})")
+            
+            account_data = {
+                'account_name': account_name,
+                'account_id': account_id,
+                'regions': {}
+            }
+            
+            account_has_data = False
+            
+            for region in self.regions:
+                logger.info(f"Processing region: {region}")
+                
+                # Assume role in target account
+                session = self.assume_cross_account_role(account_id, region)
+                if not session:
+                    continue
+                
+                # Get instance management summary using Explorer APIs (GetOpsSummary)
+                instance_mgmt_summary = self.get_instance_management_summary_from_explorer(session)
+                
+                # Skip regions with no EC2 instances
+                if instance_mgmt_summary['total_ec2_instances'] == 0:
+                    logger.info(f"No EC2 instances found in {account_name} - {region}")
+                    continue
+                
+                account_has_data = True
+                
+                # Get patch compliance summary with corrected totals
+                patch_compliance_summary = self.get_patch_compliance_summary_corrected(
+                    session, 
+                    instance_mgmt_summary['managed_instances']
+                )
+                
+                region_data = {
+                    # Instance management data
+                    'total_ec2_instances': instance_mgmt_summary['total_ec2_instances'],
+                    'managed_instances': instance_mgmt_summary['managed_instances'],
+                    'not_managed_instances': instance_mgmt_summary['not_managed_instances'],
+                    'managed_percentage': instance_mgmt_summary['managed_percentage'],
+                    
+                    # Patch compliance data (corrected)
+                    'compliant_instances': patch_compliance_summary['compliant_instances'],
+                    'non_compliant_instances': patch_compliance_summary['non_compliant_instances'],
+                    'unreported_instances': patch_compliance_summary['unreported_instances']
+                }
+                
+                account_data['regions'][region] = region_data
+                
+                # Update organization totals
+                org_summary = all_data['organization_summary']
+                org_summary['total_ec2_instances'] += instance_mgmt_summary['total_ec2_instances']
+                org_summary['managed_instances'] += instance_mgmt_summary['managed_instances']
+                org_summary['not_managed_instances'] += instance_mgmt_summary['not_managed_instances']
+                org_summary['compliant_instances'] += patch_compliance_summary['compliant_instances']
+                org_summary['non_compliant_instances'] += patch_compliance_summary['non_compliant_instances']
+                org_summary['unreported_instances'] += patch_compliance_summary['unreported_instances']
+            
+            # Only include accounts that have data
+            if account_has_data:
+                all_data['accounts'][account_id] = account_data
+        
+        # Calculate organization-level percentages
+        org_summary = all_data['organization_summary']
+        total_instances = org_summary['total_ec2_instances']
+        managed_instances = org_summary['managed_instances']
+        
+        if total_instances > 0:
+            org_summary['managed_percentage'] = round((managed_instances / total_instances) * 100, 1)
+        
+        return all_data
+    
+    def generate_improved_email_report(self, compliance_data: Dict) -> str:
+        """Generate improved HTML email with better formatting and readability"""
+        
+        org_summary = compliance_data['organization_summary']
+        
+        # Calculate compliance percentages (based on managed instances only)
+        managed_instances = org_summary['managed_instances']
+        compliant_instances = org_summary['compliant_instances']
+        non_compliant_instances = org_summary['non_compliant_instances']
+        unreported_instances = org_summary['unreported_instances']
+        
+        # Verify totals match
+        total_reported = compliant_instances + non_compliant_instances + unreported_instances
+        if total_reported != managed_instances:
+            logger.warning(f"Compliance total mismatch: {total_reported} reported vs {managed_instances} managed")
+        
+        compliant_pct = round((compliant_instances / max(1, managed_instances)) * 100, 1) if managed_instances > 0 else 0.0
+        non_compliant_pct = round((non_compliant_instances / max(1, managed_instances)) * 100, 1) if managed_instances > 0 else 0.0
+        unreported_pct = round((unreported_instances / max(1, managed_instances)) * 100, 1) if managed_instances > 0 else 0.0
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ 
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                    margin: 15px; 
+                    font-size: 12px;
+                    line-height: 1.4;
+                    color: #333;
+                }}
+                table {{ 
+                    border-collapse: collapse; 
+                    width: 100%; 
+                    margin: 12px 0; 
+                    font-size: 11px;
+                }}
+                th, td {{ 
+                    border: 1px solid #ddd; 
+                    padding: 6px 8px; 
+                    text-align: left; 
+                }}
+                th {{ 
+                    background-color: #f8f9fa;
+                    font-weight: 600;
+                    font-size: 10px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.3px;
+                }}
+                td {{
+                    font-size: 11px;
+                }}
+                h1 {{ 
+                    font-size: 18px; 
+                    font-weight: 600; 
+                    margin: 0 0 8px 0;
+                    color: #2c3e50;
+                }}
+                h2 {{ 
+                    font-size: 14px; 
+                    font-weight: 600; 
+                    margin: 15px 0 8px 0;
+                    color: #34495e;
+                }}
+                .section {{ 
+                    margin-bottom: 20px; 
+                }}
+                .note {{ 
+                    background-color: #f8f9fa; 
+                    padding: 8px 12px; 
+                    margin: 8px 0; 
+                    font-size: 10px;
+                    border-left: 3px solid #007bff;
+                    color: #666;
+                }}
+                .header-info {{
+                    font-size: 11px;
+                    color: #666;
+                    margin-bottom: 15px;
+                }}
+                .metric-highlight {{
+                    font-weight: 600;
+                    color: #2c3e50;
+                }}
+                .account-table th {{
+                    font-size: 9px;
+                    padding: 4px 6px;
+                }}
+                .account-table td {{
+                    font-size: 10px;
+                    padding: 4px 6px;
+                }}
+                .footer {{
+                    margin-top: 20px;
+                    font-size: 10px;
+                    color: #999;
+                    text-align: center;
+                    padding-top: 15px;
+                    border-top: 1px solid #eee;
+                }}
+            </style>
+        </head>
+        <body>
+            <h1>AWS Patch Compliance Report</h1>
+            <div class="header-info">
+                Generated: {compliance_data['generation_time']}<br>
+                Organization: Multi-Account AWS Organization<br>
+                Regions: {', '.join(self.regions)}
+            </div>
+            
+            <div class="note">
+                <strong>Data Sources:</strong> Instance management from Explorer API, Compliance data from Fleet Manager API
+            </div>
+            
+            <div class="section">
+                <h2>Amazon EC2 Instance Management</h2>
+                <table>
+                    <tr>
+                        <th>Status</th>
+                        <th>Count</th>
+                        <th>Percentage</th>
+                    </tr>
+                    <tr>
+                        <td>Total EC2 Instances</td>
+                        <td class="metric-highlight">{org_summary['total_ec2_instances']}</td>
+                        <td>100.0%</td>
+                    </tr>
+                    <tr>
+                        <td>Managed by Systems Manager</td>
+                        <td class="metric-highlight">{org_summary['managed_instances']}</td>
+                        <td>{org_summary['managed_percentage']}%</td>
+                    </tr>
+                    <tr>
+                        <td>Not Managed by Systems Manager</td>
+                        <td class="metric-highlight">{org_summary['not_managed_instances']}</td>
+                        <td>{round(100 - org_summary['managed_percentage'], 1)}%</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div class="section">
+                <h2>Compliance Summary (Managed Instances)</h2>
+                <table>
+                    <tr>
+                        <th>Compliance Status</th>
+                        <th>Count</th>
+                        <th>Percentage</th>
+                    </tr>
+                    <tr>
+                        <td>Total Managed Instances</td>
+                        <td class="metric-highlight">{managed_instances}</td>
+                        <td>100.0%</td>
+                    </tr>
+                    <tr>
+                        <td>Compliant</td>
+                        <td class="metric-highlight">{compliant_instances}</td>
+                        <td>{compliant_pct}%</td>
+                    </tr>
+                    <tr>
+                        <td>Non-Compliant</td>
+                        <td class="metric-highlight">{non_compliant_instances}</td>
+                        <td>{non_compliant_pct}%</td>
+                    </tr>"""
+        
+        # Only show unreported if there are any
+        if unreported_instances > 0:
+            html += f"""
+                    <tr>
+                        <td>No Compliance Data</td>
+                        <td class="metric-highlight">{unreported_instances}</td>
+                        <td>{unreported_pct}%</td>
+                    </tr>"""
+        
+        html += """
+                </table>
+            </div>
+        """
+        
+        # Account details section with improved formatting
+        if compliance_data['accounts']:
+            html += """
+            <div class="section">
+                <h2>Account and Region Details</h2>
+                <table class="account-table">
+                    <tr>
+                        <th>Account</th>
+                        <th>ID</th>
+                        <th>Region</th>
+                        <th>Total EC2</th>
+                        <th>Managed</th>
+                        <th>Managed %</th>
+                        <th>Compliant</th>
+                        <th>Non-Compliant</th>
+                    </tr>
+            """
+            
+            for account_id, account_data in compliance_data['accounts'].items():
+                account_name = account_data['account_name']
+                
+                for region, region_data in account_data['regions'].items():
+                    # Truncate account name if too long
+                    display_name = account_name[:12] + "..." if len(account_name) > 15 else account_name
+                    display_id = account_id[-4:]  # Show only last 4 digits
+                    
+                    html += f"""
+                        <tr>
+                            <td>{display_name}</td>
+                            <td>...{display_id}</td>
+                            <td>{region}</td>
+                            <td>{region_data['total_ec2_instances']}</td>
+                            <td>{region_data['managed_instances']}</td>
+                            <td>{region_data['managed_percentage']}%</td>
+                            <td>{region_data['compliant_instances']}</td>
+                            <td>{region_data['non_compliant_instances']}</td>
+                        </tr>
+                    """
+            
+            html += """
+                </table>
+            </div>
+            """
+        
+        html += f"""
+            <div class="footer">
+                Report generated by AWS Patch Compliance Reporter<br>
+                Verification: Compliant ({compliant_instances}) + Non-Compliant ({non_compliant_instances}) + No Data ({unreported_instances}) = {compliant_instances + non_compliant_instances + unreported_instances} = Total Managed ({managed_instances})
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+    
+    def generate_and_send_report(self, compliance_data: Dict):
+        """Generate and send improved email report"""
+        try:
+            # Generate improved HTML report
+            html_body = self.generate_improved_email_report(compliance_data)
+            
+            # Prepare email subject
+            org_summary = compliance_data['organization_summary']
+            managed_instances = org_summary['managed_instances']
+            compliant_instances = org_summary['compliant_instances']
+            compliant_pct = round((compliant_instances / max(1, managed_instances)) * 100, 1) if managed_instances > 0 else 0.0
+            
+            subject = f"AWS Patch Compliance Report - {org_summary['total_ec2_instances']} total, {managed_instances} managed, {compliant_instances} compliant ({compliant_pct}%)"
+            
+            # Send email using your SES module
+            # Uncomment and modify based on your SES setup:
+            # send_email(
+            #     sender_address=self.sender_email,
+            #     receiver_addresses=self.recipient_emails,
+            #     subject=subject,
+            #     body=html_body
+            # )
+            
+            logger.info(f"Email report generated successfully")
+            logger.info(f"Subject: {subject}")
+            
+        except Exception as e:
+            logger.error(f"Error generating email report: {str(e)}")
+            raise
+
+# Lambda handler entry point
+def lambda_handler(event, context):
+    reporter = PatchComplianceReporter()
+    return reporter.lambda_handler(event, context)
