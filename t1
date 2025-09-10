@@ -1,0 +1,11 @@
+last_modified_epoch = f.get("modifiedTime")
+if last_modified_epoch:
+    try:
+        # Oracle returns epoch in milliseconds
+        last_modified_utc = datetime.datetime.utcfromtimestamp(
+            int(last_modified_epoch) / 1000
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        last_modified_utc = "unknown"
+else:
+    last_modified_utc = "unknown"
