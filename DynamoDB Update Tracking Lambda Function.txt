@@ -1,0 +1,148 @@
+import json
+import boto3
+import logging
+import os
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+dynamodb = boto3.resource('dynamodb')
+
+def lambda_handler(event, context):
+    """
+    Updates DynamoDB tracking records with status changes throughout the remediation process
+    """
+    try:
+        # Handle both direct invocation and Step Functions payload
+        if 'Payload' in event:
+            payload = event['Payload']
+        else:
+            payload = event
+            
+        tracking_id = payload.get('tracking_id')
+        status = payload.get('status')
+        
+        if not tracking_id or not status:
+            logger.error(f"Missing required parameters: tracking_id={tracking_id}, status={status}")
+            return {
+                'Payload': {
+                    'success': False,
+                    'error': 'Missing required parameters'
+                }
+            }
+        
+        logger.info(f"Updating tracking record {tracking_id} with status {status}")
+        
+        # Update the tracking record
+        success = update_tracking_record(tracking_id, status, payload)
+        
+        return {
+            'Payload': {
+                'success': success,
+                'tracking_id': tracking_id,
+                'status': status,
+                'updated_at': datetime.utcnow().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating tracking record: {str(e)}")
+        return {
+            'Payload': {
+                'success': False,
+                'error': str(e),
+                'tracking_id': event.get('tracking_id', 'Unknown')
+            }
+        }
+
+def update_tracking_record(tracking_id, status, payload):
+    """Update the DynamoDB tracking record with new information"""
+    try:
+        table_name = os.environ.get('DYNAMODB_TABLE_NAME', f'patch-tracking-{os.environ.get("ENVIRONMENT", "prod")}')
+        table = dynamodb.Table(table_name)
+        
+        # Find the record by tracking_id using GSI
+        response = table.query(
+            IndexName='tracking-id-index',
+            KeyConditionExpression='tracking_id = :tracking_id',
+            ExpressionAttributeValues={':tracking_id': tracking_id}
+        )
+        
+        if not response.get('Items'):
+            logger.error(f"No tracking record found for tracking_id: {tracking_id}")
+            return False
+        
+        item = response['Items'][0]
+        instance_id = item['instance_id']
+        timestamp = item['timestamp']
+        
+        # Prepare update expression and values
+        update_expression_parts = ['#st = :status', 'updated_at = :updated']
+        expression_attribute_names = {'#st': 'status'}
+        expression_attribute_values = {
+            ':status': status,
+            ':updated': datetime.utcnow().isoformat()
+        }
+        
+        # Add specific fields based on status and payload content
+        if status == 'dry_run_completed':
+            if payload.get('simulation_result'):
+                update_expression_parts.append('simulation_result = :sim_result')
+                expression_attribute_values[':sim_result'] = json.dumps(payload['simulation_result'], default=str)
+            if payload.get('simulation_error'):
+                update_expression_parts.append('simulation_error = :sim_error')
+                expression_attribute_values[':sim_error'] = json.dumps(payload['simulation_error'], default=str)
+        
+        elif status == 'remediation_started':
+            if payload.get('step_functions_execution_arn'):
+                update_expression_parts.append('step_functions_execution_arn = :sf_arn')
+                expression_attribute_values[':sf_arn'] = payload['step_functions_execution_arn']
+        
+        elif status == 'remediation_command_sent':
+            if payload.get('remediation_command_id'):
+                update_expression_parts.append('remediation_command_id = :cmd_id')
+                expression_attribute_values[':cmd_id'] = payload['remediation_command_id']
+        
+        elif status == 'patch_retry_started':
+            if payload.get('patch_retry_command_id'):
+                update_expression_parts.append('patch_retry_command_id = :retry_cmd_id')
+                expression_attribute_values[':retry_cmd_id'] = payload['patch_retry_command_id']
+        
+        elif status in ['remediation_successful', 'remediation_failed']:
+            if payload.get('final_outcome'):
+                update_expression_parts.append('final_outcome = :outcome')
+                expression_attribute_values[':outcome'] = payload['final_outcome']
+            if payload.get('compliance_check'):
+                update_expression_parts.append('final_compliance_check = :compliance')
+                expression_attribute_values[':compliance'] = json.dumps(payload['compliance_check'], default=str)
+            if payload.get('failure_context'):
+                update_expression_parts.append('failure_context = :failure_ctx')
+                expression_attribute_values[':failure_ctx'] = json.dumps(payload['failure_context'], default=str)
+        
+        elif status == 'escalated_to_support':
+            if payload.get('escalation_reason'):
+                update_expression_parts.append('escalation_reason = :escalation_reason')
+                expression_attribute_values[':escalation_reason'] = payload['escalation_reason']
+        
+        elif status == 'ticket_creation_failed':
+            if payload.get('ticket_error'):
+                update_expression_parts.append('ticket_error = :ticket_error')
+                expression_attribute_values[':ticket_error'] = json.dumps(payload['ticket_error'], default=str)
+        
+        # Perform the update
+        update_expression = 'SET ' + ', '.join(update_expression_parts)
+        
+        table.update_item(
+            Key={'instance_id': instance_id, 'timestamp': timestamp},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=expression_attribute_names,
+            ExpressionAttributeValues=expression_attribute_values
+        )
+        
+        logger.info(f"Successfully updated tracking record {tracking_id} with status {status}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error updating tracking record {tracking_id}: {str(e)}")
+        return False

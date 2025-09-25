@@ -1,0 +1,410 @@
+{
+  "Comment": "Complete self-healing patch remediation with DynamoDB tracking and Bedrock support tickets",
+  "StartAt": "CheckDryRunMode",
+  "States": {
+    "CheckDryRunMode": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.remediation_plan.dry_run",
+          "BooleanEquals": true,
+          "Next": "DryRunSimulation"
+        }
+      ],
+      "Default": "ValidateInput"
+    },
+    "DryRunSimulation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DryRunSimulationFunction}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.simulation_result",
+      "Next": "UpdateDryRunStatus",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.simulation_error",
+          "Next": "UpdateDryRunStatus"
+        }
+      ]
+    },
+    "UpdateDryRunStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "dry_run_completed",
+          "simulation_result.$": "$.simulation_result",
+          "simulation_error.$": "$.simulation_error"
+        }
+      },
+      "End": true
+    },
+    "ValidateInput": {
+      "Type": "Pass",
+      "Result": {
+        "sns_topic_arn": "${PatchRemediationTopic}",
+        "escalation_topic_arn": "${PatchRemediationEscalationTopic}",
+        "verify_compliance_function_name": "${VerifyPatchComplianceFunction}",
+        "bedrock_ticket_function_name": "${BedrockSupportTicketFunction}",
+        "update_tracking_function_name": "${UpdateTrackingFunction}"
+      },
+      "ResultPath": "$.config",
+      "Next": "UpdateProcessingStarted"
+    },
+    "UpdateProcessingStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "remediation_started",
+          "step_functions_execution_arn.$": "$$.Execution.Arn"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "DetermineRemediationStrategy"
+    },
+    "DetermineRemediationStrategy": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "disk_space_cleanup",
+          "Next": "CrossPlatformDiskSpaceRemediation"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "service_management",
+          "Next": "CrossPlatformServiceManagement"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "network_troubleshooting",
+          "Next": "CrossPlatformNetworkRemediation"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "agent_recovery",
+          "Next": "CrossPlatformAgentRecovery"
+        },
+        {
+          "Variable": "$.remediation_plan.escalate",
+          "BooleanEquals": true,
+          "Next": "UpdateEscalationStatus"
+        }
+      ],
+      "Default": "UpdateEscalationStatus"
+    },
+    "CrossPlatformDiskSpaceRemediation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformDiskCleanup",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["3600"]
+        }
+      },
+      "ResultPath": "$.remediation_command",
+      "Next": "UpdateRemediationCommandSent",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.remediation_error",
+          "Next": "CaptureRemediationFailure"
+        }
+      ]
+    },
+    "CrossPlatformServiceManagement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformServiceManagement",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["3600"]
+        }
+      },
+      "ResultPath": "$.remediation_command",
+      "Next": "UpdateRemediationCommandSent",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.remediation_error",
+          "Next": "CaptureRemediationFailure"
+        }
+      ]
+    },
+    "CrossPlatformNetworkRemediation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformNetworkTroubleshooting",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "ResultPath": "$.remediation_command",
+      "Next": "UpdateRemediationCommandSent",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.remediation_error",
+          "Next": "CaptureRemediationFailure"
+        }
+      ]
+    },
+    "CrossPlatformAgentRecovery": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformSSMAgentRecovery",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "ResultPath": "$.remediation_command",
+      "Next": "UpdateRemediationCommandSent",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.remediation_error",
+          "Next": "CaptureRemediationFailure"
+        }
+      ]
+    },
+    "UpdateRemediationCommandSent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "remediation_command_sent",
+          "remediation_command_id.$": "$.remediation_command.Command.CommandId"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "WaitForRemediationCompletion"
+    },
+    "WaitForRemediationCompletion": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "RestartStoppedServices"
+    },
+    "RestartStoppedServices": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformServiceRestart",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "ResultPath": "$.service_restart_command",
+      "Next": "WaitForServiceRestart",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.service_restart_error",
+          "Next": "RetryPatchOperation"
+        }
+      ]
+    },
+    "WaitForServiceRestart": {
+      "Type": "Wait",
+      "Seconds": 120,
+      "Next": "RetryPatchOperation"
+    },
+    "RetryPatchOperation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunPatchBaseline",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "Operation": ["Install"],
+          "RebootOption": ["RebootIfNeeded"]
+        }
+      },
+      "ResultPath": "$.patch_retry_command",
+      "Next": "UpdatePatchRetryStarted",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.patch_retry_error",
+          "Next": "CaptureRemediationFailure"
+        }
+      ]
+    },
+    "UpdatePatchRetryStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "patch_retry_started",
+          "patch_retry_command_id.$": "$.patch_retry_command.Command.CommandId"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "WaitForPatchCompletion"
+    },
+    "WaitForPatchCompletion": {
+      "Type": "Wait",
+      "Seconds": 900,
+      "Next": "VerifyPatchSuccess"
+    },
+    "VerifyPatchSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${VerifyPatchComplianceFunction}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.compliance_check",
+      "Next": "EvaluateSuccess"
+    },
+    "EvaluateSuccess": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.compliance_check.Payload.patch_status",
+          "StringEquals": "COMPLIANT",
+          "Next": "UpdateSuccessfulRemediation"
+        }
+      ],
+      "Default": "CaptureRemediationFailure"
+    },
+    "UpdateSuccessfulRemediation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "remediation_successful",
+          "final_outcome": "successful",
+          "compliance_check.$": "$.compliance_check"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "RemediationSuccessful"
+    },
+    "CaptureRemediationFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "failure_context": {
+          "remediation_error.$": "$.remediation_error",
+          "service_restart_error.$": "$.service_restart_error", 
+          "patch_retry_error.$": "$.patch_retry_error",
+          "compliance_check.$": "$.compliance_check",
+          "step_functions_execution_arn.$": "$$.Execution.Name",
+          "failure_timestamp.$": "$$.State.EnteredTime"
+        }
+      },
+      "ResultPath": "$.failure_context",
+      "Next": "UpdateFailureContext"
+    },
+    "UpdateFailureContext": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "remediation_failed",
+          "final_outcome": "failed",
+          "failure_context.$": "$.failure_context"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "CreateBedrockSupportTicket"
+    },
+    "UpdateEscalationStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "escalated_to_support",
+          "escalation_reason.$": "$.remediation_plan.strategy_selection_reason"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "CreateBedrockSupportTicket"
+    },
+    "CreateBedrockSupportTicket": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BedrockSupportTicketFunction}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.support_ticket",
+      "Next": "NotifyTicketCreation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.ticket_creation_error",
+          "Next": "UpdateTicketError"
+        }
+      ]
+    },
+    "UpdateTicketError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateTrackingFunction}",
+        "Payload": {
+          "tracking_id.$": "$.tracking_id",
+          "status": "ticket_creation_failed",
+          "ticket_error.$": "$.ticket_creation_error"
+        }
+      },
+      "ResultPath": "$.tracking_update",
+      "Next": "FallbackNotification"
+    },
+    "NotifyTicketCreation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${PatchRemediationEscalationTopic}",
+        "Subject": "AWS Support Ticket Created - Patch Remediation Failed",
+        "Message.$": "States.Format('Automated patch remediation failed for {} instance {}. AWS Support ticket created with ID: {}. Tracking ID: {}. Bedrock analysis summary: {}', $.remediation_plan.platform, $.instance_id, $.support_ticket.Payload.ticket_id, $.tracking_id, $.support_ticket.Payload.bedrock_analysis.summary)"
+      },
+      "End": true
+    },
+    "FallbackNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${PatchRemediationEscalationTopic}",
+        "Subject": "Patch Remediation Failed - Support Ticket Creation Error",
+        "Message.$": "States.Format('Automated patch remediation failed for {} instance {}. Could not create support ticket due to error. Tracking ID: {}. Manual intervention required.', $.remediation_plan.platform, $.instance_id, $.tracking_id)"
+      },
+      "End": true
+    },
+    "RemediationSuccessful": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${PatchRemediationTopic}",
+        "Subject": "Cross-Platform Patch Remediation Successful",
+        "Message.$": "States.Format('Successfully remediated patch failure on {} instance {} using {} strategy. Tracking ID: {}. Confidence Score: {}%', $.remediation_plan.platform, $.instance_id, $.remediation_plan.strategy, $.tracking_id, $.remediation_plan.confidence_score)"
+      },
+      "End": true
+    }
+  }
+}
