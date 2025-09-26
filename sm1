@@ -1,0 +1,231 @@
+{
+  "Comment": "Simplified self-healing patch remediation - 2 Lambda functions only",
+  "StartAt": "DetermineRemediationStrategy",
+  "States": {
+    "DetermineRemediationStrategy": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "disk_space_cleanup",
+          "Next": "DiskSpaceRemediation"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "service_management",
+          "Next": "ServiceManagement"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "network_troubleshooting",
+          "Next": "NetworkTroubleshooting"
+        },
+        {
+          "Variable": "$.remediation_plan.strategy",
+          "StringEquals": "agent_recovery",
+          "Next": "AgentRecovery"
+        },
+        {
+          "Variable": "$.remediation_plan.escalate",
+          "BooleanEquals": true,
+          "Next": "CreateSupportTicket"
+        }
+      ],
+      "Default": "CreateSupportTicket"
+    },
+    "DiskSpaceRemediation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformDiskCleanup",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["3600"]
+        }
+      },
+      "Next": "WaitForRemediation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "ServiceManagement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformServiceManagement", 
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["3600"]
+        }
+      },
+      "Next": "WaitForRemediation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "NetworkTroubleshooting": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformNetworkTroubleshooting",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "Next": "WaitForRemediation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "AgentRecovery": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformSSMAgentRecovery",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "Next": "WaitForRemediation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "WaitForRemediation": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "RestartServices"
+    },
+    "RestartServices": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "CrossPlatformServiceRestart",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "executionTimeout": ["1800"]
+        }
+      },
+      "Next": "WaitForServiceRestart",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RetryPatchOperation"
+        }
+      ]
+    },
+    "WaitForServiceRestart": {
+      "Type": "Wait",
+      "Seconds": 120,
+      "Next": "RetryPatchOperation"
+    },
+    "RetryPatchOperation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunPatchBaseline",
+        "InstanceIds.$": "States.Array($.instance_id)",
+        "Parameters": {
+          "Operation": ["Install"],
+          "RebootOption": ["RebootIfNeeded"]
+        }
+      },
+      "Next": "WaitForPatchCompletion",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "WaitForPatchCompletion": {
+      "Type": "Wait",
+      "Seconds": 900,
+      "Next": "VerifyPatchCompliance"
+    },
+    "VerifyPatchCompliance": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstancePatchStates",
+      "Parameters": {
+        "InstanceIds.$": "States.Array($.instance_id)"
+      },
+      "Next": "EvaluateSuccess",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CreateSupportTicket"
+        }
+      ]
+    },
+    "EvaluateSuccess": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.InstancePatchStates[0].FailedCount",
+          "NumericEquals": 0,
+          "Next": "RemediationSuccessful"
+        }
+      ],
+      "Default": "CreateSupportTicket"
+    },
+    "CreateSupportTicket": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BedrockSupportTicketFunction}",
+        "Payload.$": "$"
+      },
+      "Next": "NotifyTicketCreation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FallbackNotification"
+        }
+      ]
+    },
+    "NotifyTicketCreation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${EscalationTopic}",
+        "Subject": "🚨 AWS Support Ticket Created - Patch Remediation Failed",
+        "Message.$": "States.Format('❌ Patch remediation failed for {} instance {}\n\n🎫 Support ticket created: {}\n🔍 Severity: {}\n⚡ Platform: {}\n🔧 Failed strategy: {}\n\nPlease check the support ticket for detailed analysis and next steps.', $.remediation_plan.platform, $.instance_id, $.Payload.ticket_id, $.Payload.ticket_details.severity, $.remediation_plan.platform, $.remediation_plan.strategy)"
+      },
+      "End": true
+    },
+    "FallbackNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${EscalationTopic}",
+        "Subject": "❌ Patch Remediation Failed - Manual Intervention Required",
+        "Message.$": "States.Format('❌ Patch remediation failed for {} instance {}\n\n⚠️ Could not create support ticket automatically\n🔧 Failed strategy: {}\n\n🔴 URGENT: Manual intervention required immediately.\nPlease investigate the patch failure and create a support ticket manually if needed.', $.remediation_plan.platform, $.instance_id, $.remediation_plan.strategy)"
+      },
+      "End": true
+    },
+    "RemediationSuccessful": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${NotificationTopic}",
+        "Subject": "✅ Patch Remediation Successful",
+        "Message.$": "States.Format('✅ Successfully remediated patch failure!\n\n🖥️ Instance: {}\n⚡ Platform: {}\n🔧 Strategy used: {}\n⏱️ Auto-healing completed\n\nThe instance is now patch compliant and ready for normal operations.', $.instance_id, $.remediation_plan.platform, $.remediation_plan.strategy)"
+      },
+      "End": true
+    }
+  }
+}
