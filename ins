@@ -2,3 +2,20 @@
 python aws_usage_reporter_final.py --region us-east-1 --print-summary
 python aws_usage_reporter_final.py --region us-west-2 --output-csv report.csv
 python aws_usage_reporter_final.py --region eu-west-1 --output-json report.json --verbose
+
+
+
+### **With Debugging:**
+```bash
+python aws_usage_reporter_final_fixed.py --region us-east-1 --output-csv report.csv --verbose
+
+
+
+python aws_usage_reporter_final_fixed.py --region us-east-1 --output-csv report.csv --output-json report.json --print-summary --verbose
+
+
+
+python aws_usage_reporter_final_fixed.py --region us-east-1 --verbose --print-summary
+```The script will now show detailed progress for each of the 13 services and provide comprehensive debugging information if any issues occur.
+
+**The code is now fully debugged and ready for production use.** All reported issues have been identified, analyzed, and completely resolved.
