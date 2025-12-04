@@ -1,0 +1,95 @@
+Quick Troubleshooting Summary for Intermittent Cortex Engine Reporting
+For intermittent connectivity issues (engines disconnecting and reconnecting periodically), focus on these high-priority checks rather than permanent failures:
+
+Critical Quick Checks
+1. Time Synchronization (Most Common for Intermittent Issues)​```bash
+timedatectl status
+sudo systemctl restart systemd-timesyncd
+
+text
+SSL/TLS handshakes fail when system clocks are out of sync—even by small amounts. This often causes intermittent disconnects that resolve when time resyncs.[2][1]
+
+**2. Check Logs for Patterns**[2]
+```bash
+sudo tail -100 /var/log/demisto/d1.log | grep -i "error\|timeout\|disconn"
+Look for repeating errors at specific times—indicates scheduled issues (backups, maintenance, load spikes).
+
+3. Monitor System Load & Memory in Real-time​
+
+bash
+watch -n 1 'free -h; echo "---"; top -bn1 | head -15'
+Intermittent disconnects often spike during high load periods. High I/O wait (check with iostat) can cause connection timeouts.​
+
+4. Network Connectivity Verification​
+
+bash
+# Test multiple times to catch intermittent drops
+for i in {1..5}; do 
+  echo "Attempt $i: $(date)"
+  curl -kvv wss://<cortex_server>:443/d1ws 2>&1 | grep -i "connected\|refused\|timeout"
+  sleep 2
+done
+If some attempts fail and others succeed, it's a network issue.​
+
+5. Check for Memory Leaks​
+
+bash
+ps aux | grep d1 | grep -v grep
+# Watch memory usage over time
+watch -n 5 'ps aux | grep d1 | grep -v grep | awk "{print \$6}"'
+If memory grows over time before disconnecting, you have a memory leak.​
+
+Secondary Checks (if above don't reveal issues)
+6. Disk/Inode Space During Disconnects
+
+bash
+# Check if full during disconnection events
+df -h /var
+df -i /var
+Intermittent failures when disk/inodes near 90% capacity.​
+
+7. Firewall/Network Packet Loss​
+
+bash
+ping <cortex_server> -c 100 | grep -i "loss"
+# Should show 0% packet loss
+Even 1-2% packet loss causes WebSocket reconnects.​
+
+8. Service Auto-Restart Configuration​
+
+bash
+sudo systemctl cat d1 | grep -i "restart"
+If Restart=always without proper delay (RestartSec), rapid crashes create the appearance of intermittent issues.​
+
+What to Collect When Reporting
+When escalating to support, capture this data during or immediately after a disconnect event:
+
+bash
+# Create diagnostic bundle while disconnected
+journalctl --since "1 hour ago" > cortex_journals.log
+ps aux > process_snapshot.log
+free -h > memory_snapshot.log
+df -h > disk_snapshot.log
+vmstat 1 10 > vmstat_snapshot.log
+
+tar -czf cortex_intermittent_bundle.tar.gz \
+  cortex_journals.log process_snapshot.log \
+  memory_snapshot.log disk_snapshot.log vmstat_snapshot.log \
+  /var/log/demisto/d1.log /usr/local/demisto/d1.conf
+Most Likely Culprits for Intermittent Issues (in order of probability):
+Time drift – clocks slowly desyncing​
+
+Memory leak – d1 process grows over hours/days until OOM​
+
+High load spikes – concurrent tasks causing timeouts​
+
+Network congestion/packet loss – happens during peak traffic times​
+
+Disk filling up periodically – logs or temp data accumulating​
+
+Service restart loop – crashes repeatedly due to misconfiguration​
+
+Start with time sync, then monitor memory growth and system load during the next disconnect event. These two items resolve 80% of intermittent engine issues.
+
+</generate
+
