@@ -1,6 +1,6 @@
 ```python
 """
-SSM Patch Compliance Dashboard
+SSM Patch Compliance Dashboard2
 
 Features:
 - Filter by account and region
@@ -8,13 +8,11 @@ Features:
 - Patch compliance summary with aggregated statistics
 - Detailed patch compliance report by instance
 - Patch details with severity breakdown
-- Tabs: Patch Groups, Instances, Available Patches, Severity Summary, Time-Based Trends
-- Color-coded compliance status (RED for Non-Compliant, GREEN for Compliant)
-- Metrics: Compliant, Non-Compliant, Missing patches, Failed patches
-- Visualizations: Managed instances, Compliance summary, Noncompliance reasons
+- Tabs: Compliance Summary, Instances, Available Patches, Missing Patches
+- Color-coded compliance status (RED for Non-Compliant, YELLOW for Compliant with Issues, GREEN for Compliant)
+- Metrics: Compliant, Non-Compliant, Unspecified instances
 - CSV export
 - Graphs and charts for analysis
-- Time-based trends: Patches over time, Compliance by launch date
 
 Uses your utils.py
 """
@@ -124,41 +122,46 @@ def fetch_account_region_data(account_id, account_name, region, role):
     except Exception as e:
         errors.append(f"⚠️ {account_name}/{region}: SSM instances - {str(e)[:50]}")
     
-    # Get patch states - FIXED: Use proper pagination
+    # Get patch states
     try:
-        paginator = ssm.get_paginator('describe_instance_patch_states')
-        for page in paginator.paginate():
-            for state in page.get('InstancePatchStates', []):
-                iid = state['InstanceId']
-                if iid not in instance_map:
-                    continue
-                
-                installed = state.get('InstalledCount', 0)
-                missing = state.get('MissingCount', 0)
-                failed = state.get('FailedCount', 0)
-                
-                if failed > 0:
-                    status = 'COMPLIANT_FAILED'
-                elif missing > 0:
-                    status = 'COMPLIANT_MISSING'
-                else:
-                    status = 'COMPLIANT'
-                
-                instances.append({
-                    'Account Name': account_name,
-                    'Region': region,
-                    'Instance ID': iid,
-                    'Instance Name': instance_map[iid]['name'],
-                    'Platform': instance_map[iid]['platform'],
-                    'Compliance Status': status,
-                    'Installed Patches': installed,
-                    'Missing Patches': missing,
-                    'Failed Patches': failed,
-                    'Instance State': instance_map[iid]['state'],
-                    'Launch Time': instance_map[iid]['launch'],
-                    'Managed': True
-                })
-                instance_map[iid]['managed'] = True
+        if managed_ids:
+            managed_list = list(managed_ids)
+            # Batch if >50, but for simplicity, assume <50 or use multiple calls
+            batch_size = 50
+            for i in range(0, len(managed_list), batch_size):
+                batch = managed_list[i:i+batch_size]
+                patch_states = ssm.describe_instance_patch_states(InstanceIds=batch)['InstancePatchStates']
+                for state in patch_states:
+                    iid = state['InstanceId']
+                    if iid not in instance_map:
+                        continue
+                    
+                    installed = state.get('InstalledCount', 0)
+                    missing = state.get('MissingCount', 0)
+                    failed = state.get('FailedCount', 0)
+                    
+                    if failed > 0:
+                        status = 'NON_COMPLIANT_FAILED'
+                    elif missing > 0:
+                        status = 'NON_COMPLIANT_MISSING'
+                    else:
+                        status = 'COMPLIANT'
+                    
+                    instances.append({
+                        'Account Name': account_name,
+                        'Region': region,
+                        'Instance ID': iid,
+                        'Instance Name': instance_map[iid]['name'],
+                        'Platform': instance_map[iid]['platform'],
+                        'Compliance Status': status,
+                        'Installed Patches': installed,
+                        'Missing Patches': missing,
+                        'Failed Patches': failed,
+                        'Instance State': instance_map[iid]['state'],
+                        'Launch Time': instance_map[iid]['launch'],
+                        'Managed': True
+                    })
+                    instance_map[iid]['managed'] = True
     except Exception as e:
         errors.append(f"⚠️ {account_name}/{region}: Patch states - {str(e)[:50]}")
     
@@ -180,7 +183,7 @@ def fetch_account_region_data(account_id, account_name, region, role):
                 'Managed': False
             })
     
-    # Get patch groups - FIXED: Proper filtering
+    # Get patch groups
     try:
         paginator = ssm.get_paginator('describe_patch_groups')
         for page in paginator.paginate():
@@ -219,7 +222,8 @@ def fetch_account_region_data(account_id, account_name, region, role):
                     'Title': patch.get('Title', 'N/A'),
                     'Classification': patch.get('Classification', 'N/A'),
                     'Severity': patch.get('Severity', 'N/A'),
-                    'Release Date': patch.get('ReleaseDate', None)
+                    'Release Date': patch.get('ReleaseDate', None),
+                    'Content URL': patch.get('ContentUrl', 'N/A')
                 })
     except Exception as e:
         errors.append(f"⚠️ {account_name}/{region}: Patches - {str(e)[:50]}")
@@ -273,6 +277,8 @@ def fetch_all_data(account_ids, accounts, regions):
 account_ids, regions = setup_account_filter(page_key="patch")
 
 st.sidebar.markdown("---")
+debug_mode = st.sidebar.checkbox("Show Debug Info", value=False)
+
 if st.sidebar.button("📊 Fetch Data", type="primary", use_container_width=True):
     st.session_state.pc_fetch_clicked = True
 
@@ -302,6 +308,11 @@ if st.session_state.pc_fetch_clicked:
 # DISPLAY DASHBOARD
 # ============================================================================
 
+if debug_mode and st.session_state.pc_data and st.session_state.pc_data.get('err'):
+    with st.expander("🐛 Debug Info"):
+        for error in st.session_state.pc_data['err']:
+            st.write(error)
+
 if not st.session_state.pc_data:
     st.info("👈 Select accounts and regions, then click 'Fetch Data' button in sidebar")
 else:
@@ -310,9 +321,8 @@ else:
     grp_df = pd.DataFrame(data['grp']) if data['grp'] else pd.DataFrame()
     pat_df = pd.DataFrame(data['pat']) if data['pat'] else pd.DataFrame()
     
-    # Convert dates to string for display
     if not inst_df.empty:
-        inst_df['Launch Time Display'] = inst_df['Launch Time'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime) else 'N/A')
+        inst_df['Launch Time Display'] = inst_df['Launch Time'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if isinstance(x, datetime) else 'N/A')
     if not pat_df.empty:
         pat_df['Release Date Display'] = pat_df['Release Date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime) else 'N/A')
     
@@ -345,8 +355,8 @@ else:
         st.subheader("📊 Summary")
         
         comp = len(inst_df[inst_df['Compliance Status'] == 'COMPLIANT']) if not inst_df.empty else 0
-        miss = len(inst_df[inst_df['Compliance Status'] == 'COMPLIANT_MISSING']) if not inst_df.empty else 0
-        fail = len(inst_df[inst_df['Compliance Status'] == 'COMPLIANT_FAILED']) if not inst_df.empty else 0
+        miss = len(inst_df[inst_df['Compliance Status'] == 'NON_COMPLIANT_MISSING']) if not inst_df.empty else 0
+        fail = len(inst_df[inst_df['Compliance Status'] == 'NON_COMPLIANT_FAILED']) if not inst_df.empty else 0
         unmg = len(inst_df[inst_df['Compliance Status'] == 'UNMANAGED']) if not inst_df.empty else 0
         total = len(inst_df)
         mngd = total - unmg
@@ -410,8 +420,8 @@ else:
         # Compliance
         with c2:
             comp_data = [comp, miss, fail, unmg]
-            comp_labs = ['Compliant', 'Non-Compliant (Missing)', 'Non-Compliant (Failed)', 'Unmanaged']
-            comp_cols = ['#28a745', '#fd7e14', '#dc3545', '#6c757d']
+            comp_labs = ['Compliant', 'Compliant w/ Issues (Missing)', 'Compliant w/ Issues (Failed)', 'Unmanaged']
+            comp_cols = ['#28a745', '#ffc107', '#dc3545', '#6c757d']
             comp_data_flt = [v for v, l in zip(comp_data, comp_labs) if v > 0]
             comp_labs_flt = [l for v, l in zip(comp_data, comp_labs) if v > 0]
             comp_cols_flt = [c for v, c in zip(comp_data, comp_cols) if v > 0]
@@ -465,7 +475,7 @@ else:
             st.markdown("---")
         
         # ===== TABS =====
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Patch Groups", "🖥️ Instances", "🔵 Available Patches", "📊 Severity Summary", "📈 Time-Based Trends"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 Compliance Summary", "🖥️ Instances", "🔵 Available Patches", "📦 Missing Patches"])
         
         with tab1:
             st.subheader("Patch Compliance Summary by Patch Group")
@@ -500,9 +510,9 @@ else:
                 
                 def highlight_compliance(row):
                     status = row['Compliance Status']
-                    if status == 'COMPLIANT_FAILED':
+                    if status == 'NON_COMPLIANT_FAILED':
                         return ['background-color: #f8d7da'] * len(row)
-                    elif status == 'COMPLIANT_MISSING':
+                    elif status == 'NON_COMPLIANT_MISSING':
                         return ['background-color: #fff3cd'] * len(row)
                     elif status == 'UNMANAGED':
                         return ['background-color: #e2e3e5'] * len(row)
@@ -532,7 +542,7 @@ else:
             if not filtered_pat.empty:
                 unique_patches = filtered_pat.drop_duplicates(subset=['Patch ID']).copy()
                 
-                display_cols = ['Patch ID', 'Title', 'Classification', 'Severity', 'Release Date Display']
+                display_cols = ['Patch ID', 'Title', 'Classification', 'Severity', 'Release Date Display', 'Content URL']
                 display_df = unique_patches[display_cols].sort_values('Severity', ascending=False).reset_index(drop=True)
                 
                 def highlight_severity(row):
@@ -564,58 +574,47 @@ else:
                 st.info("ℹ️ No patch data available.")
         
         with tab4:
-            st.subheader("Patches by Severity")
+            st.subheader("Missing Patches per Instance")
             
-            if not filtered_pat.empty:
-                sev_counts = filtered_pat['Severity'].value_counts()
-                cls_counts = filtered_pat['Classification'].value_counts()
-                
-                c1, c2 = st.columns(2)
-                
-                with c1:
-                    fig = go.Figure(data=[go.Pie(labels=sev_counts.index, values=sev_counts.values, hole=0.3)])
-                    fig.update_layout(title_text="Patches by Severity", height=400)
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with c2:
-                    fig = go.Figure(data=[go.Bar(x=cls_counts.index, y=cls_counts.values, marker_color='#1f77b4')])
-                    fig.update_layout(title_text="Patches by Classification", xaxis_title="Classification", yaxis_title="Count", height=400)
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("ℹ️ No patch severity data available.")
-        
-        with tab5:
-            st.subheader("Time-Based Patch Trends")
-            
-            if not filtered_pat.empty and 'Release Date' in filtered_pat.columns:
-                # Patches over time
-                pat_trend = filtered_pat.dropna(subset=['Release Date'])
-                if not pat_trend.empty:
-                    pat_trend['Release Month'] = pat_trend['Release Date'].dt.to_period('M').astype(str)
-                    pat_count = pat_trend.groupby('Release Month').size().reset_index(name='Count')
-                    fig_pat = px.line(pat_count, x='Release Month', y='Count', title='Available Patches Released Over Time', markers=True)
-                    st.plotly_chart(fig_pat, use_container_width=True)
-                else:
-                    st.info("ℹ️ No patch release date data available.")
-            
-            if not filtered_inst.empty and 'Launch Time' in filtered_inst.columns:
-                # Compliance by launch date
-                inst_trend = filtered_inst.dropna(subset=['Launch Time'])
-                if not inst_trend.empty:
-                    inst_trend['Launch Month'] = inst_trend['Launch Time'].dt.to_period('M').astype(str)
-                    # Average missing patches by launch month
-                    miss_avg = inst_trend.groupby('Launch Month')['Missing Patches'].mean().reset_index(name='Average Missing Patches')
-                    fig_miss = px.line(miss_avg, x='Launch Month', y='Average Missing Patches', title='Average Missing Patches by Instance Launch Month', markers=True)
-                    st.plotly_chart(fig_miss, use_container_width=True)
+            if not filtered_inst.empty:
+                selected_instance = st.selectbox("Select Instance:", options=filtered_inst['Instance ID'].unique())
+                if selected_instance:
+                    row = filtered_inst[filtered_inst['Instance ID'] == selected_instance].iloc[0]
+                    account_name = row['Account Name']
+                    region = row['Region']
                     
-                    # Compliance rate by launch month
-                    inst_trend['Compliant'] = inst_trend['Compliance Status'] == 'COMPLIANT'
-                    comp_rate = inst_trend.groupby('Launch Month')['Compliant'].mean().reset_index(name='Compliance Rate')
-                    comp_rate['Compliance Rate'] *= 100  # to percentage
-                    fig_comp = px.line(comp_rate, x='Launch Month', y='Compliance Rate', title='Compliance Rate by Instance Launch Month (%)', markers=True)
-                    st.plotly_chart(fig_comp, use_container_width=True)
-                else:
-                    st.info("ℹ️ No instance launch date data available.")
+                    ssm = get_ssm(get_account_id_by_name(account_name, st.session_state.get('accounts', [])), "readonly-role", region)
+                    if ssm:
+                        try:
+                            missing_patches = []
+                            paginator = ssm.get_paginator('describe_instance_patches')
+                            for page in paginator.paginate(InstanceId=selected_instance, Filters=[{'Key': 'State', 'Values': ['Missing']}]):
+                                for patch in page.get('Patches', []):
+                                    missing_patches.append({
+                                        'Patch ID': patch.get('KBId', patch.get('Id', 'N/A')),
+                                        'Title': patch.get('Title', 'N/A'),
+                                        'Classification': patch.get('Classification', 'N/A'),
+                                        'Severity': patch.get('Severity', 'N/A'),
+                                        'Release Date': patch.get('ReleaseDate', 'N/A').strftime('%Y-%m-%d') if patch.get('ReleaseDate') else 'N/A'
+                                    })
+                            
+                            if missing_patches:
+                                missing_df = pd.DataFrame(missing_patches)
+                                st.dataframe(missing_df, use_container_width=True)
+                                
+                                csv = missing_df.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Missing Patches CSV",
+                                    data=csv,
+                                    file_name=f"missing_patches_{selected_instance}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    mime="text/csv"
+                                )
+                            else:
+                                st.info("No missing patches for this instance.")
+                        except Exception as e:
+                            st.error(f"Error fetching missing patches: {str(e)}")
+                    else:
+                        st.error("Failed to get SSM client for this account/region.")
             else:
-                st.info("ℹ️ No data for trends.")
+                st.info("ℹ️ No instances available.")
 ```
